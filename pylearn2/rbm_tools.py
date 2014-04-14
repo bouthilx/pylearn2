@@ -6,6 +6,7 @@ import theano
 from theano import tensor, config
 from theano.tensor import nnet
 from pylearn2.utils.rng import make_np_rng, make_theano_rng
+from pylearn2.utils.mem import TypicalMemoryError
 
 
 def compute_log_z(rbm, free_energy_fn, max_bits=15):
@@ -49,10 +50,10 @@ def compute_log_z(rbm, free_energy_fn, max_bits=15):
             dtype=config.floatX
         )
     except MemoryError:
-        raise MemoryError("failed to allocate (%d, %d) matrix of "
-                          "type %s in compute_log_z; try a smaller "
-                          "value of max_bits" %
-                          (block_size, width, str(config.floatX)))
+        raise TypicalMemoryError("failed to allocate (%d, %d) matrix of "
+                                 "type %s in compute_log_z; try a smaller "
+                                 "value of max_bits" %
+                                 (block_size, width, str(config.floatX)))
 
     # fill in the first block_bits, which will remain fixed for all
     # 2**width configs
@@ -62,19 +63,19 @@ def compute_log_z(rbm, free_energy_fn, max_bits=15):
     try:
         logz_data = numpy.array(logz_data_c, order='F', dtype=config.floatX)
     except MemoryError:
-        raise MemoryError("failed to allocate (%d, %d) matrix of "
-                          "type %s in compute_log_z; try a smaller "
-                          "value of max_bits" %
-                          (block_size, width, str(config.floatX)))
+        raise TypicalMemoryError("failed to allocate (%d, %d) matrix of "
+                                 "type %s in compute_log_z; try a smaller "
+                                 "value of max_bits" %
+                                 (block_size, width, str(config.floatX)))
 
     # Allocate storage for (negative) free-energy of all 2**width
     # configurations.
     try:
         nFE = numpy.zeros(2 ** width, dtype=config.floatX)
     except MemoryError:
-        raise MemoryError("failed to allocate free energy storage array "
-                          "in compute_log_z; your model is too big to use "
-                          "with this function")
+        raise TypicalMemoryError("failed to allocate free energy storage array "
+                                 "in compute_log_z; your model is too big to use "
+                                 "with this function")
 
     # now loop 2**(width - block_bits) times, filling in the
     # most-significant bits
