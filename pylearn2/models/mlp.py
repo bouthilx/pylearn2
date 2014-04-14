@@ -1601,7 +1601,7 @@ class Linear(Layer):
     include_prob : float, optional
         Probability of including a weight element in the set of weights \
         initialized to U(-irange, irange). If not included it is \
-        initialized to 0.
+        initialized to 1.
     init_bias : float or ndarray, optional
         Anything that can be broadcasted to a numpy vector.
         Provides the initial value of the biases of the model.
@@ -2088,8 +2088,7 @@ class Sigmoid(Linear):
         - p log sigmoid(z) - (1-p) log sigmoid(-z)
         p softplus(-z) + (1-p) softplus(z)
         """
-        batch_axis = self.output_space.get_batch_axis()
-        total = kl(Y=Y, Y_hat=Y_hat, batch_axis=batch_axis)
+        total = self.kl(Y=Y, Y_hat=Y_hat)
 
         ave = total.mean()
 
@@ -2126,7 +2125,6 @@ class Sigmoid(Linear):
         ave : Variable
             average kl divergence between Y and Y_hat.
         """
-
         batch_axis = self.output_space.get_batch_axis()
         div = kl(Y=Y, Y_hat=Y_hat, batch_axis=batch_axis)
         return div
@@ -2407,14 +2405,14 @@ class SigmoidConvNonlinearity(ConvNonlinearity):
 
     @wraps(ConvNonlinearity.get_monitoring_channels_from_state)
     def get_monitoring_channels_from_state(self, state, target,
-                                           orval=None, cost_fn=None):
-        rval = OrderedDict()
+                                           rval=None, cost_fn=None):
+        orval = OrderedDict()
         y_hat = state > 0.5
         y = target > 0.5
         wrong_bit = T.cast(T.neq(y, y_hat), state.dtype)
 
-        rval['01_loss'] = wrong_bit.mean()
-        rval['kl'] = cost_fn(Y_hat=state, Y=target)
+        orval['01_loss'] = wrong_bit.mean()
+        orval['kl'] = cost_fn(Y_hat=state, Y=target)
 
         y = T.cast(y, state.dtype)
         y_hat = T.cast(y_hat, state.dtype)
@@ -2423,30 +2421,31 @@ class SigmoidConvNonlinearity(ConvNonlinearity):
         precision = tp / T.maximum(1., tp + fp)
         recall = tp / T.maximum(1., y.sum())
 
-        rval['precision'] = precision
-        rval['recall'] = recall
-        rval['f1'] = 2. * precision * recall / T.maximum(1, precision + recall)
+        orval['precision'] = precision
+        orval['recall'] = recall
+        orval['f1'] = (2. * precision * recall /
+                       T.maximum(1, precision + recall))
 
         tp = (y * y_hat).sum(axis=[0, 1])
         fp = ((1-y) * y_hat).sum(axis=[0, 1])
         precision = tp / T.maximum(1., tp + fp)
 
-        rval['per_output_precision.max'] = precision.max()
-        rval['per_output_precision.mean'] = precision.mean()
-        rval['per_output_precision.min'] = precision.min()
+        orval['per_output_precision.max'] = precision.max()
+        orval['per_output_precision.mean'] = precision.mean()
+        orval['per_output_precision.min'] = precision.min()
 
         recall = tp / T.maximum(1., y.sum(axis=[0, 1]))
 
-        rval['per_output_recall.max'] = recall.max()
-        rval['per_output_recall.mean'] = recall.mean()
-        rval['per_output_recall.min'] = recall.min()
+        orval['per_output_recall.max'] = recall.max()
+        orval['per_output_recall.mean'] = recall.mean()
+        orval['per_output_recall.min'] = recall.min()
 
         f1 = 2. * precision * recall / T.maximum(1, precision + recall)
 
-        rval['per_output_f1.max'] = f1.max()
-        rval['per_output_f1.mean'] = f1.mean()
-        rval['per_output_f1.min'] = f1.min()
-        rval = orval.update(rval)
+        orval['per_output_f1.max'] = f1.max()
+        orval['per_output_f1.mean'] = f1.mean()
+        orval['per_output_f1.min'] = f1.min()
+        rval.update(orval)
         return rval
 
 
@@ -2575,6 +2574,12 @@ class ConvElemwise(Layer):
             raise AssertionError("You should specify either irange or "
                                  "sparse_init when calling the constructor of "
                                  "ConvElemwise and not both.")
+
+        if pool_type is not None:
+            assert pool_shape is not None, ("You should specify the shape of "
+                                           "the spatial %s-pooling." % pool_type)
+            assert pool_stride is not None, ("You should specify the strides of "
+                                            "the spatial %s-pooling." % pool_type)
 
         assert nonlinearity is not None
 
@@ -2857,11 +2862,11 @@ class ConvElemwise(Layer):
                                                       "pooling.")
 
             if self.pool_type == 'max':
-                p = max_pool(bc01=z, pool_shape=self.pool_shape,
+                p = max_pool(bc01=d, pool_shape=self.pool_shape,
                         pool_stride=self.pool_stride,
                         image_shape=self.detector_space.shape)
             elif self.pool_type == 'mean':
-                p = mean_pool(bc01=z, pool_shape=self.pool_shape,
+                p = mean_pool(bc01=d, pool_shape=self.pool_shape,
                         pool_stride=self.pool_stride,
                         image_shape=self.detector_space.shape)
 
@@ -3732,6 +3737,75 @@ class FlattenerLayer(Layer):
     def get_weights(self):
 
         return self.raw_layer.get_weights()
+
+
+class WindowLayer(Layer):
+    """
+    Layer used to select a window of an image input.
+    The input of the layer must be Conv2DSpace.
+
+    Parameters
+    ----------
+    layer_name : str
+        A name for this layer.
+    window : tuple
+        A four-tuple of ints indicating respectively
+        the top left x and y position, and
+        the bottom right x and y position of the window.
+    """
+
+    def __init__(self, layer_name, window):
+        super(WindowLayer, self).__init__()
+        self.__dict__.update(locals())
+        del self.self
+        if window[0] < 0 or window[0] > window[2] or \
+           window[1] < 0 or window[1] > window[3]:
+            raise ValueError("WindowLayer: bad window parameter")
+
+    @wraps(Layer.fprop)
+    def fprop(self, state_below):
+        extracts = [slice(None), slice(None), slice(None), slice(None)]
+        extracts[self.rows] = slice(self.window[0], self.window[2] + 1)
+        extracts[self.cols] = slice(self.window[1], self.window[3] + 1)
+        extracts = tuple(extracts)
+
+        return state_below[extracts]
+
+    @wraps(Layer.set_input_space)
+    def set_input_space(self, space):
+        self.input_space = space
+
+        if not isinstance(space, Conv2DSpace):
+            raise TypeError("The input to a Window layer should be a "
+                            "Conv2DSpace,  but layer " + self.layer_name +
+                            " got " + str(type(self.input_space)))
+        axes = space.axes
+        self.rows = axes.index(0)
+        self.cols = axes.index(1)
+
+        nrows = space.shape[0]
+        ncols = space.shape[1]
+
+        if self.window[2] + 1 > nrows or self.window[3] + 1 > ncols:
+            raise ValueError("WindowLayer: bad window shape. "
+                             "Input is [" + str(nrows)  + ", " +
+                             str(ncols) + "], "
+                             "but layer " + self.layer_name + " has window "
+                             + str(self.window))
+        self.output_space = Conv2DSpace(
+                                shape=[self.window[2] - self.window[0] + 1,
+                                       self.window[3] - self.window[1] + 1],
+                                num_channels=space.num_channels,
+                                axes=axes
+                                )
+
+    @wraps(Layer.get_params)
+    def get_params(self):
+        return []
+
+    @wraps(Layer.get_monitoring_channels)
+    def get_monitoring_channels(self):
+        return []
 
 
 def generate_dropout_mask(mlp, default_include_prob=0.5,
